@@ -1,0 +1,199 @@
+//Map.addLayer(geometry,{color:'coral'},"AOI"); // add the Area of Interest layer in the bottom screen
+Map.centerObject(geometry,8); //Get the AOI in the center of the layout screen 
+
+var l8_start_date = ee.Date('2020-01-01'); // start date for 2020
+var l8_end_date = l8_start_date.advance(1,'year'); // end date for 2020
+
+var l5_start_date = ee.Date('1995-01-01'); // start date for 2015
+var l5_end_date = l5_start_date.advance(1,'year'); // end date for 2015
+
+var exportResolutionMeters = 30; //coastline resoltion in vector format
+var waterbodySizeMeters = 2000; // within this size will  be removed (it's depends on the AOI)
+var islandSizeMeters = 2000; // within this size will  be removed (it's depends on the AOI)
+
+var col_l8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2') //select the landsat-8 images for the study
+                   .filter(ee.Filter.date(l8_start_date, l8_end_date))
+                   .filter(ee.Filter.bounds(geometry));
+                   
+var col_l5 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2") //select the landsat-5 images for the study
+                   .filter(ee.Filter.date(l5_start_date, l5_end_date))
+                   .filter(ee.Filter.bounds(geometry));                  
+                   
+//__________________________--landsat 8 cloud Masking--_______________________________                   
+// Apply cloud mask
+var maskL8sr = function(image) {
+  var qaMask = image.select('QA_PIXEL')
+                    .bitwiseAnd(parseInt('11111', 2)).eq(0);
+  var saturationMask = image.select('QA_RADSAT').eq(0);
+
+// Apply the scaling factors to the appropriate bands.
+  var opticalBands = image.select('SR_B.')
+    .multiply(0.0000275).add(-0.2);
+  var thermalBands = image.select('ST_B.*')
+    .multiply(0.00341802).add(149.0);
+
+// Replace the original bands with the scaled ones and apply the masks.
+  return image.addBands(opticalBands, null, true)
+      .addBands(thermalBands, null, true)
+      .updateMask(qaMask)
+      .updateMask(saturationMask);
+      };
+
+var col_l8 = col_l8.map(maskL8sr);
+var col_l5 = col_l5.map(maskL8sr);
+//__________________________________________________________________________________//
+
+
+// Select and Rename Bands
+var col_l8 = col_l8.select(                 
+  ['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7'],
+  ['blue',  'green', 'red',   'nir',   'swir1', 'swir2']
+);
+var col_l5 = col_l5.select(                 
+  ['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B7'],
+  ['blue',  'green', 'red',   'nir',   'swir1', 'swir2']
+);
+
+var composite_l8 = col_l8.median().clip(geometry); // Create a median composite and clip
+var composite_l5 = col_l5.median().clip(geometry);
+
+var RGBvis = {bands: ['red','green','blue'],min:0,max:0.3}; // RGB colour for visulization 
+
+Map.addLayer(composite_l8,RGBvis,"Landsat_8_Natural_Comoposite_Image");
+Map.addLayer(composite_l5,RGBvis,"Landsat_5_Natural_Comoposite_Image");
+
+var detect_water = function(image){               // Extract water body using AWEI (Automated Water Extraction Index) 
+        var awei = image.expression(                // by (Mustafa et al, 2017) https://doi.org/10.5281/zenodo.1040209.
+          '4*(GREEN-SWIR1)-(0.25*NIR + 2.75*SWIR2)',
+          {
+            'GREEN':image.select('green'),
+            'SWIR1':image.select('swir1'),
+            'SWIR2':image.select('swir2'),
+            'NIR':image.select('nir'),
+          }).rename('awei');
+
+//Otsu Thresholding
+// for details abut Otsu Thresholdin: https://medium.com/google-earth/otsus-method-for-image-segmentation-f5c48f405e#:~:text=Otsu's%20method%20is%20a%20means,2016).
+         var thresholding = require('users/gena/packages:thresholding');
+         var scale = 100;
+         var bounds = geometry;
+         var cannyThreshold = 0.7;
+         var cannySigma = 1;
+         var minValue = -0.2;
+         var th = thresholding.computeThresholdUsingOtsu(
+           awei,scale,bounds, cannyThreshold, cannySigma, minValue);
+         var water = awei.gt(th).rename('water');
+  
+  return water;
+
+};
+var water_l8 = detect_water(composite_l8);
+var water_l5 = detect_water(composite_l5);
+
+var waterVizulization_l8= {min:0,max:1,palette:['white','blue']};
+var waterVizulization_l5= {min:0,max:1,palette:['white','coral']};
+
+Map.addLayer(water_l8,waterVizulization_l8,"Only Water in 2020");
+Map.addLayer(water_l5,waterVizulization_l5,"Only Water in 1995");
+
+// This function takes a binary Land-Water image and
+// removes inland water and small islands
+function removeInlandWaterAndIslands(waterImage) {
+  // reduceConnectedComponents expects an interger image
+  waterImage = waterImage.int();
+  
+  // Define neighborhood based on user parameters
+  var connectedPixelsLand = ee.Number(waterbodySizeMeters)
+    .divide(exportResolutionMeters).int();
+    
+  var connectedPixelsWater = ee.Number(islandSizeMeters)
+    .divide(exportResolutionMeters).int();
+
+  // Remove inland water
+  var landFilled = waterImage.addBands(waterImage)
+   .reduceConnectedComponents(
+     ee.Reducer.median(), 'water', connectedPixelsLand)
+   .unmask(99).eq(99).and(waterImage.neq(0));
+  
+  // Remove small islands  
+  var waterFilled = landFilled.addBands(landFilled)
+    .reduceConnectedComponents(
+      ee.Reducer.median(), 'water_1', connectedPixelsWater)
+    .unmask(99).eq(99).and(landFilled.neq(1));    
+  
+  // Land-Water Boundary
+  return waterFilled;
+}
+var landWaterBoundary_l8 = removeInlandWaterAndIslands(water_l8);
+var landWaterBoundary_l5 = removeInlandWaterAndIslands(water_l5);
+
+var landWaterBoundaryVis_l8 = {min:0, max:1, palette: ['blue', 'white']};
+var landWaterBoundaryVis_l5 = {min:0, max:1, palette: ['coral', 'white']};
+
+Map.addLayer(landWaterBoundary_l8, landWaterBoundaryVis_l8,
+  'Land-Water Boundary_2020 (Raster)');
+Map.addLayer(landWaterBoundary_l5, landWaterBoundaryVis_l5,
+  'Land-Water Boundary_1995 (Raster)');
+
+// Convert the coastline image to vector
+var vectors_l8 = ee.Image(landWaterBoundary_l8).selfMask()
+  .reduceToVectors({
+    geometry: geometry,
+    scale: exportResolutionMeters,
+    eightConnected: true,
+    maxPixels: 1e10,
+    tileScale: 16
+  });
+  
+  var vectors_l5 = ee.Image(landWaterBoundary_l5).selfMask()
+  .reduceToVectors({
+    geometry: geometry,
+    scale: exportResolutionMeters,
+    eightConnected: true,
+    maxPixels: 1e10,
+    tileScale: 16
+  });
+
+// This function takes vectorized polygons and 
+// extracts a polyline
+var simplifyAndExtractCoastline = function(vectors){
+  // Simplify vectors
+  var processedVectors = vectors.map(function(f) {
+    var coords = f.geometry()
+      .simplify({maxError: exportResolutionMeters})
+      .coordinates();
+    
+    // Buffer the geometry by a pixel to avoid rasterizing
+    // the boundary polygon
+    var bufferDistance = ee.Number(
+      exportResolutionMeters).multiply(-1);
+    return f
+      .setGeometry(
+        ee.Geometry.MultiLineString(coords)
+          .intersection(geometry.buffer(bufferDistance)));
+  });
+  return processedVectors;
+};
+
+var coastlineVector_l8 = simplifyAndExtractCoastline(vectors_l8);
+var coastlineVector_l5 = simplifyAndExtractCoastline(vectors_l5);
+
+
+  
+Map.addLayer(coastlineVector_l8, {color: 'red'},
+  'Coastline in 2020 (Vector)');
+Map.addLayer(coastlineVector_l5, {color: 'coral'},
+  'Coastline in 1995 (Vector)');
+  
+print("Number of Poly_lines in 2020:",coastlineVector_l8.size());
+print("Number of Poly_lines in 1995:",coastlineVector_l5.size());
+
+print("Coastlines Length in 2020 (km):",coastlineVector_l8.geometry().length().divide(1000));
+print("Coastlines Length in 1995 (km):",coastlineVector_l5.geometry().length().divide(1000));
+
+
+
+
+
+  
+
